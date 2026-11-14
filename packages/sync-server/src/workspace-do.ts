@@ -49,6 +49,7 @@ import { findArchivedIssues, findArchivedIssuesPage, findIssueDetails } from "./
 import {
 	findGitHubRow,
 	findWebhookRow,
+	findWebhookRowsOf,
 	githubTarget,
 	pruneAudit,
 	readAuditPage,
@@ -586,6 +587,29 @@ export class WorkspaceDO extends DurableObject {
 			deleteWebhook(this.#db, shortId.parse(id));
 			if (before) this.#audit(member, "webhook.deleted", webhookTarget(before), Date.now());
 			return null;
+		});
+	}
+
+	/**
+	 * Removes every webhook that sets off one agent, for the gateway taking back a connection it
+	 * made (its rollback, or its undo token, which it has checked): no member is named. Only
+	 * the gateway calls this. A webhook made for an agent in a connection is the only kind that
+	 * names an agent the connection's own request has just made. Answers how many went.
+	 */
+	removeConnectedWebhooksOf(agentId: string): number {
+		const parsed = shortId.safeParse(agentId);
+		if (!parsed.success) return 0;
+		return this.ctx.storage.transactionSync(() => {
+			const rows = findWebhookRowsOf(this.#db, parsed.data);
+			for (const row of rows) {
+				deleteWebhook(this.#db, row.id);
+				recordAudit(
+					this.#db,
+					{ actorId: null, action: "webhook.deleted", target: webhookTarget(row) },
+					Date.now(),
+				);
+			}
+			return rows.length;
 		});
 	}
 
