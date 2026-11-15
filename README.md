@@ -20,7 +20,8 @@
   <a href="https://track-demo.gateweave.com"><strong>Try the demo</strong></a> ·
   <a href="https://gateweave.com/watch/issue-to-pull-request.mp4"><strong>Watch an agent take an issue (45 s)</strong></a> ·
   <a href="#deploying"><strong>Deploy your own</strong></a> ·
-  <a href="https://gateweave.com/blog/one-cloudflare-worker">What it measures and costs</a>
+  <a href="https://gateweave.com/blog/one-cloudflare-worker">What it measures and costs</a> ·
+  <a href="https://gateweave.com/questions">Questions people ask</a>
 </p>
 
 <picture>
@@ -216,8 +217,8 @@ each release changed.
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and our
 [Code of Conduct](CODE_OF_CONDUCT.md). If you work with an AI coding agent, point it at
-[AGENTS.md](AGENTS.md). Report security issues privately, as described in
-[SECURITY.md](SECURITY.md).
+[AGENTS.md](AGENTS.md). Questions and ideas go to [GitHub Discussions](https://github.com/gateweavehq/track/discussions).
+Report security issues privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
