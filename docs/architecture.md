@@ -688,14 +688,31 @@ only configuration. The manual way, under Settings, stays.
    secret opens nothing. The page answers `return?code=<code>&state=<state>`, added to any query
    the return address has. Cancel answers `return?error=denied&state=<state>` and makes nothing.
    The audit log has what it has for an agent and a webhook, and an `agent.connected` event naming
-   the asking origin.
+   the asking origin. The row also holds, in the clear, the workspace id, the agent's id and the
+   asking origin. They are not secret; they are what lets a code that is never used be taken back
+   without opening the seal (see below). The key, the secret and the undo token stay sealed, and
+   the challenge and the identifier stay bound into the seal's additional data. The code's own
+   minute is `goodUntil` in the row, and the row's `expiresAt` is three days later
+   (`ROW_KEPT_MS`): Better Auth deletes every `verification` row past its `expiresAt` whenever it
+   looks one up, a sign-in for one, so a row that ran out with its code would usually be gone
+   before anyone could take back what it was made for. A row written by v0.39.0 has no such ids
+   and no `goodUntil`: its `expiresAt` is its minute, it goes with the general prune, and nothing
+   is taken back for it.
 5. **`POST /api/connect/exchange`** takes `{ code, verifier }` and no session; cookies are never
    read. It deletes the row by its identifier, returning it, **before** looking at anything else:
    the delete is what decides, so of two exchanges at once exactly one gets a row, and a code
-   that fails any check below is spent all the same. It then checks the row has not expired, that
+   that fails any check below is spent all the same. It then checks the code's minute is not over, that
    `base64url(SHA-256(verifier))` equals the challenge, in constant time, and that the seal opens.
    Answers `{ agentKey, webhookSecret, agent: { id, memberId, name }, workspace: { id, slug, name }, webhook: { id }, undo }`.
    Every way of failing, including a body of the wrong shape, is the same `400 {"error":"invalid_code"}`.
+   A body of the wrong shape is refused before the delete: it spends nothing and takes nothing back.
+   A code that is spent and then fails (late, a wrong verifier, a seal that does not open) leaves
+   the asking server with no undo token, which comes only in a good answer, so the exchange takes
+   back what the row was made for, the way undo does (below), before it answers; the answer is
+   the same. If that fails, it is logged, without secrets, the answer is still the same, and it
+   is tried again later (below).
+   Someone holding a stolen code but not the verifier could already spend it by exchanging it;
+   they now also cause this cleanup: the same denial as before, with less left behind.
 6. **`POST /api/connect/undo`** takes `{ undo }`, a token the exchange returned: the workspace,
    agent and webhook ids and an expiry ten minutes on, signed with HMAC-SHA-256 under a key derived
    from `BETTER_AUTH_SECRET` with its own purpose string (`track-connect-undo-v1`). It deletes the
@@ -703,6 +720,29 @@ only configuration. The manual way, under Settings, stays.
    twice and answers `200 {"ok":true}` whether or not they were still there; a forged, altered or
    late token is `400 {"error":"invalid_undo"}` and does nothing. The removals are audit events
    by Track itself.
+7. **Codes never traded.** A code whose tab was closed, or whose asking server was down, expires
+   and would leave its agent and webhook behind. So rows of this kind past their time are swept:
+   each is deleted with `DELETE ... RETURNING` (so a sweep and a late exchange cannot both act on
+   one row) and what its readable ids name is taken back with the same function undo uses (the
+   webhooks that name the agent, then the agent, then the membership sync), with an
+   `agent.deleted` audit event by Track itself that names the asking origin and the reason. A
+   sweep acts only on ids read from a row it just deleted, so it never touches an agent whose
+   code was traded (its row is gone) or one made by hand. Which rows are due is read from
+   `sweepAt` inside the row (`json_extract`), at first the code's own minute, never from
+   `expiresAt`. It runs on every Allow, for up to 5 rows so that Allow stays fast, and on the
+   Worker's daily run, before the general prune of expired `verification` rows. When taking back
+   fails, which a workspace's object being restarted is enough for, the row goes back in with
+   only the ids, `goodUntil: 0` so that no code opens it, and a `sweepAt` an hour on; it is tried
+   three times in all, then left to the log. That row's identifier is `track-connect:retry.` and
+   a random id, which no code hashes to, so an asking server that exchanges again cannot spend
+   the tries in seconds. The table is Better Auth's as well, and not every value in it is JSON:
+   the sweep reads `sweepAt` only from a value that is (`json_valid`), and compares the prefix
+   exactly. An agent that someone took over by hand in the meantime is left alone: the row names the key
+   the connection made, and only while that is the agent's one key, never used, is the agent
+   taken back. After a rollback to v0.39.0, which
+   judges a code by `expiresAt`, delete the `track-connect:` rows: a row this version wrote
+   would otherwise be good there for three days instead of a minute (it still needs the code
+   and its verifier).
 
 Both routes count calls per client address in a `RateLimiter` Durable Object (20 at once,
 refilling over an hour, within 100 a day, shared by the two), by the zone a Worker comes from

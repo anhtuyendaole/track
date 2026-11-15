@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { isAdminRole } from "@gateweave/track-protocol";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
 	type ConnectPurpose,
@@ -42,6 +42,17 @@ import {
  */
 
 const CODE_TTL_MS = 60 * 1000;
+/**
+ * How long a code's row stays in the table after the code itself has run out. Better Auth deletes
+ * every row of `verification` past its `expiresAt` whenever it looks one up, and so does the daily
+ * prune, so a row whose `expiresAt` were the code's own minute would usually be gone before anyone
+ * could take back what it was made for. The code's minute is `goodUntil` inside the row instead,
+ * and `expiresAt` is this much later: long enough for a daily run that was missed twice.
+ */
+const ROW_KEPT_MS = 3 * 24 * 60 * 60 * 1000;
+/** A take-back that failed is tried again this much later, at most this many times. */
+const TAKE_BACK_AGAIN_MS = 60 * 60 * 1000;
+const TAKE_BACK_TRIES = 3;
 const UNDO_TTL_SECONDS = 10 * 60;
 /** A code row's `identifier`, so no other use of the `verification` table can be mistaken for one. */
 const IDENTIFIER_PREFIX = "track-connect:";
@@ -51,6 +62,11 @@ const UNDO_PURPOSE = "track-connect-undo-v1";
 const CODE = /^[A-Za-z0-9_-]{43}$/;
 const ID = /^[\w-]{1,64}$/;
 const MAX_BODY_BYTES = 4096;
+/** How many codes past their minute an approval clears, so Allow stays fast. */
+const SWEEP_ON_APPROVAL = 5;
+/** What one daily run clears, in rounds, so a backlog never holds the run up for long. */
+const SWEEP_ROUND = 25;
+const SWEEP_ROUNDS = 8;
 
 export function isConnectRequest(url: URL): boolean {
 	return url.pathname === "/api/connect/exchange" || url.pathname === "/api/connect/undo";
@@ -111,6 +127,191 @@ const stored = z.object({
 	ct: z.string(),
 });
 
+/**
+ * What a row says in the clear about what it was made for, so that a code that is refused or never
+ * traded can be taken back without opening the seal. These are ids, not secrets. A row written
+ * before they were kept (v0.39.0) has none, and there is nothing to take back for it.
+ */
+const madeFor = z.object({
+	workspaceId: z.string().regex(ID),
+	agentId: z.string().regex(ID),
+	// As long as an address the page takes may be (`MAX_URL_LENGTH` in connect-request.ts): a row
+	// this could not read would name nothing to take back.
+	origin: z.string().max(2048).optional(),
+	/** The key the connection made for the agent: while it is its only key and unused, nobody took the agent over. */
+	keyId: z.string().regex(ID).optional(),
+	/** How often taking it back has failed so far. */
+	tries: z.number().int().min(0).max(TAKE_BACK_TRIES).optional(),
+});
+type MadeFor = z.infer<typeof madeFor>;
+
+function readMadeFor(value: string): MadeFor | null {
+	try {
+		const read = madeFor.safeParse(JSON.parse(value));
+		return read.success ? read.data : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Takes back what a connection made: the webhooks that name the agent first, then the agent, then
+ * the membership sync. Safe to repeat. Throws when it could not finish. The audit event is
+ * Track's own, whatever `detail` is added.
+ */
+async function takeBack(workspaceId: string, agentId: string, detail: Record<string, string> = {}) {
+	// The workspace must still exist in D1 before its object is reached, which reaching it makes.
+	const workspace = await db
+		.select({ id: schema.organization.id })
+		.from(schema.organization)
+		.where(eq(schema.organization.id, workspaceId))
+		.get();
+	if (!workspace) return;
+	// The webhook first: with it gone, nothing is sent to an agent that no longer exists.
+	const stub = await findWorkspaceStub(db, workspaceId);
+	// Every webhook that names the agent, which can only be one made for it: it covers one this
+	// caller does not know of.
+	await stub.removeConnectedWebhooksOf(agentId);
+	const removed = await removeAgentOf(db, workspaceId, agentId);
+	// Whether or not this call removed it: an earlier one may have deleted the rows and then
+	// failed to tell the object, and a retry would otherwise never tell it.
+	await syncMembership(db, workspaceId, agentId);
+	if (removed !== null) {
+		await reportAudit(db, workspaceId, {
+			actorId: null,
+			action: "agent.deleted",
+			target: { type: "agent", id: agentId, label: null },
+			detail,
+		});
+	}
+}
+
+/**
+ * When a row's code stops being good, in milliseconds: `goodUntil` in the row, or for a row
+ * written before that was kept (v0.39.0), its `expiresAt`.
+ */
+function goodUntilOf(row: { value: string; expiresAt: Date }): number {
+	try {
+		const { goodUntil } = JSON.parse(row.value) as { goodUntil?: unknown };
+		if (typeof goodUntil === "number") return goodUntil;
+	} catch {
+		// Not a row this wrote: its own time stands.
+	}
+	return row.expiresAt.getTime();
+}
+
+type CodeRow = { identifier: string; value: string; expiresAt: Date };
+
+/**
+ * Takes back what a deleted row was made for. When that fails, which a workspace's object being
+ * restarted is enough for, the row goes back in as one whose code opens nothing any more
+ * (`goodUntil: 0`) and that the sweep tries again later, a few times. Only logs, with no secret.
+ */
+async function takeBackFor(row: CodeRow, reason: string): Promise<void> {
+	const made = readMadeFor(row.value);
+	if (!made) return;
+	try {
+		// An admin who found the agent in Settings and gave it a key of their own, or whose key was
+		// used, has taken it over: it is theirs now, and stays.
+		const keys = await db
+			.select({ id: schema.agentKey.id, lastUsedAt: schema.agentKey.lastUsedAt })
+			.from(schema.agentKey)
+			.where(
+				and(
+					eq(schema.agentKey.userId, made.agentId),
+					eq(schema.agentKey.organizationId, made.workspaceId),
+				),
+			)
+			.all();
+		// Told by the connection's own key: another key, a used key, or that key revoked (with or
+		// without a new one in its place) all mean someone has been managing the agent.
+		const [only] = keys;
+		const untouched =
+			keys.length === 1 &&
+			only !== undefined &&
+			only.lastUsedAt === null &&
+			(made.keyId === undefined || only.id === made.keyId);
+		if (!untouched) return;
+		await takeBack(made.workspaceId, made.agentId, {
+			reason,
+			...(made.origin && { origin: made.origin }),
+		});
+	} catch (error) {
+		console.error("connect: could not take back a connection whose code was not used", error);
+		const tries = (made.tries ?? 0) + 1;
+		if (tries >= TAKE_BACK_TRIES) return;
+		try {
+			await db
+				.insert(schema.verification)
+				.values({
+					id: crypto.randomUUID(),
+					// Not the code's identifier, which an exchange could name again and so spend the
+					// tries in seconds: one no code hashes to (a dot is not in base64url).
+					identifier: `${IDENTIFIER_PREFIX}retry.${crypto.randomUUID()}`,
+					// Only what taking it back needs: the sealed part is of no use to anyone now.
+					value: JSON.stringify({
+						...made,
+						tries,
+						goodUntil: 0,
+						sweepAt: Date.now() + TAKE_BACK_AGAIN_MS,
+					}),
+					expiresAt: new Date(Date.now() + ROW_KEPT_MS),
+				})
+				.run();
+		} catch (again) {
+			console.error("connect: could not keep a connection to take back later", again);
+		}
+	}
+}
+
+/**
+ * Takes back what codes past their minute were made for, a few at a time. Each row is deleted
+ * with `DELETE ... RETURNING`, so a sweep and a late exchange cannot both act on one row, and what
+ * is taken back is only what a row just deleted names: never an agent whose code was traded (its
+ * row is gone) or one made by hand. Answers how many rows it cleared. Never throws.
+ */
+export async function sweepConnections(max: number): Promise<number> {
+	try {
+		// By `sweepAt` in the row, not `expiresAt`, which is days later (see ROW_KEPT_MS). A row
+		// without one (v0.39.0) names nothing to take back and is left to the prune.
+		// The table is Better Auth's too, and not every value in it is JSON, which `json_extract`
+		// raises on. SQLite does not promise the order of an AND, so the guard is in the expression:
+		// only a value that is JSON is read. The prefix is compared exactly; LIKE ignores case.
+		const due = sql`substr(${schema.verification.identifier}, 1, ${IDENTIFIER_PREFIX.length}) = ${IDENTIFIER_PREFIX}
+			AND CASE WHEN json_valid(${schema.verification.value})
+				THEN json_extract(${schema.verification.value}, '$.sweepAt') END < ${Date.now()}`;
+		const rows = await db
+			.delete(schema.verification)
+			.where(
+				and(
+					due,
+					inArray(
+						schema.verification.id,
+						db
+							.select({ id: schema.verification.id })
+							.from(schema.verification)
+							.where(due)
+							.limit(max),
+					),
+				),
+			)
+			.returning()
+			.all();
+		for (const row of rows) await takeBackFor(row, "code not used");
+		return rows.length;
+	} catch (error) {
+		console.error("connect: could not sweep codes that were not used", error);
+		return 0;
+	}
+}
+
+/** The daily run's sweep: all that are due, within a bound. */
+export async function sweepAllConnections(): Promise<void> {
+	for (let round = 0; round < SWEEP_ROUNDS; round++) {
+		if ((await sweepConnections(SWEEP_ROUND)) < SWEEP_ROUND) return;
+	}
+}
+
 async function exchange(body: unknown): Promise<Response> {
 	const parsed = exchangeBody.safeParse(body);
 	if (!parsed.success) return json(NO_CODE, 400);
@@ -124,21 +325,28 @@ async function exchange(body: unknown): Promise<Response> {
 		.where(eq(schema.verification.identifier, identifier))
 		.returning()
 		.all();
-	if (!row || row.expiresAt.getTime() <= Date.now()) return json(NO_CODE, 400);
+	if (!row) return json(NO_CODE, 400);
+	// The code is spent and nobody was given what it made, with no token to undo it: so it is
+	// taken back here. The answer is the same whichever check failed.
+	const refuse = async () => {
+		await takeBackFor(row, "code refused");
+		return json(NO_CODE, 400);
+	};
+	if (goodUntilOf(row) <= Date.now()) return refuse();
 
 	let keep: z.infer<typeof stored>;
 	try {
 		keep = stored.parse(JSON.parse(row.value));
 	} catch {
-		return json(NO_CODE, 400);
+		return refuse();
 	}
-	if (!sameText(await challengeOf(verifier), keep.challenge)) return json(NO_CODE, 400);
+	if (!sameText(await challengeOf(verifier), keep.challenge)) return refuse();
 
 	let sealed: Sealed;
 	try {
 		sealed = JSON.parse(await open(code, identifier, keep)) as Sealed;
 	} catch {
-		return json(NO_CODE, 400);
+		return refuse();
 	}
 	return json(
 		{
@@ -159,34 +367,11 @@ async function undo(body: unknown): Promise<Response> {
 	if (!target) return json(NO_UNDO, 400);
 	const { workspaceId, agentId } = target;
 
-	// The workspace must still exist in D1 before its object is reached, which reaching it makes.
-	const workspace = await db
-		.select({ id: schema.organization.id })
-		.from(schema.organization)
-		.where(eq(schema.organization.id, workspaceId))
-		.get();
-	if (workspace) {
-		try {
-			// The webhook first: with it gone, nothing is sent to an agent that no longer exists.
-			const stub = await findWorkspaceStub(db, workspaceId);
-			// Every webhook that names the agent, which can only be one made for it: it covers one this
-			// token does not know of.
-			await stub.removeConnectedWebhooksOf(agentId);
-			const removed = await removeAgentOf(db, workspaceId, agentId);
-			// Whether or not this call removed it: an earlier one may have deleted the rows and then
-			// failed to tell the object, and a retry would otherwise never tell it.
-			await syncMembership(db, workspaceId, agentId);
-			if (removed !== null) {
-				await reportAudit(db, workspaceId, {
-					actorId: null,
-					action: "agent.deleted",
-					target: { type: "agent", id: agentId, label: null },
-				});
-			}
-		} catch (error) {
-			console.error("connect: undo did not finish", error);
-			return json({ error: "try_again" }, 500);
-		}
+	try {
+		await takeBack(workspaceId, agentId);
+	} catch (error) {
+		console.error("connect: undo did not finish", error);
+		return json({ error: "try_again" }, 500);
 	}
 	// The same whether they were there or not, so a token tells nothing about what is left.
 	return json({ ok: true }, 200);
@@ -296,6 +481,8 @@ export async function decideConnection(input: ApprovalInput, request: Request): 
 
 	const { workspaceId } = membership;
 	const headers = request.headers;
+	// Codes that nobody traded, which left an agent and a webhook behind: a few, so Allow stays fast.
+	await sweepConnections(SWEEP_ON_APPROVAL);
 	// The agent first. It awaits the new member's sync to the workspace's object.
 	let made: { agent: { id: string }; key: string };
 	try {
@@ -308,6 +495,19 @@ export async function decideConnection(input: ApprovalInput, request: Request): 
 		return refused(messageOf(error, "The agent member could not be made."));
 	}
 	const agentId = made.agent.id;
+	// The key just made, the agent's only one, read before anything else is awaited: how a later
+	// take-back tells that nobody has taken the agent over since.
+	// A read that fails must not leave the agent behind with nothing to take it back: without the
+	// id, a take-back goes by the count of keys alone.
+	const keyId = await db
+		.select({ id: schema.agentKey.id })
+		.from(schema.agentKey)
+		.where(
+			and(eq(schema.agentKey.userId, agentId), eq(schema.agentKey.organizationId, workspaceId)),
+		)
+		.all()
+		.then(([first]) => first?.id)
+		.catch(() => undefined);
 	const stub = workspaceStub(membership);
 	// Takes both back: the webhooks that name this agent first (this request made the agent, so
 	// they are its own, whether or not an answer about one arrived), then the agent.
@@ -376,9 +576,18 @@ export async function decideConnection(input: ApprovalInput, request: Request): 
 				value: JSON.stringify({
 					v: 1,
 					challenge: asked.challenge,
+					// Not secret: what a refused or untraded code takes back, without opening the seal.
+					workspaceId,
+					agentId,
+					...(keyId && { keyId }),
+					origin: asked.origin,
+					// The code's own minute, and when the sweep may take back what nobody traded for.
+					goodUntil: now + CODE_TTL_MS,
+					sweepAt: now + CODE_TTL_MS,
 					...(await seal(code, identifier, asked.challenge, JSON.stringify(sealed))),
 				}),
-				expiresAt: new Date(now + CODE_TTL_MS),
+				// Kept past the code's minute, so the row is still there to be swept.
+				expiresAt: new Date(now + CODE_TTL_MS + ROW_KEPT_MS),
 			})
 			.run();
 	} catch (error) {

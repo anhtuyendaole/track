@@ -370,8 +370,13 @@ describe("connecting an agent", () => {
 		const [row] = await codeRows();
 		expect(await codeRows()).toHaveLength(1);
 		expect(row?.identifier).not.toContain(code);
-		expect(row?.expires_at).toBeGreaterThan(Date.now());
-		expect(row?.expires_at).toBeLessThanOrEqual(Date.now() + 61_000);
+		// The code is good for a minute. The row itself is kept for days, so that it is still there
+		// to take back what it was made for if nobody trades the code.
+		const { goodUntil, sweepAt } = JSON.parse(row?.value ?? "{}") as Record<string, number>;
+		expect(goodUntil).toBeGreaterThan(Date.now());
+		expect(goodUntil).toBeLessThanOrEqual(Date.now() + 61_000);
+		expect(sweepAt).toBe(goodUntil);
+		expect(row?.expires_at).toBeGreaterThan(Date.now() + 2 * 24 * 60 * 60 * 1000);
 
 		const response = await exchange(code, verifier);
 		expect(response.status).toBe(200);
@@ -607,7 +612,9 @@ describe("connecting an agent", () => {
 		const v3 = newVerifier();
 		const third = await allow(owner, slug, v3);
 		await track.db
-			.prepare("UPDATE verification SET expires_at = ? WHERE identifier LIKE 'track-connect:%'")
+			.prepare(
+				"UPDATE verification SET value = json_set(value, '$.goodUntil', ?1, '$.sweepAt', ?1) WHERE identifier LIKE 'track-connect:%'",
+			)
 			.bind(Date.now() - 1000)
 			.run();
 		const late = await exchange(third.code, v3);
@@ -1048,5 +1055,345 @@ describe("the endpoints for servers", () => {
 		for (let i = 0; i < 21; i++) await call("busy.example.com");
 		expect((await call("busy.example.com")).status).toBe(429);
 		expect((await call("quiet.example.com")).status).toBe(400);
+	});
+});
+
+describe("taking back a connection whose code is not used", () => {
+	/** Makes every code past its minute. The rows stay, as they do for days. */
+	const expireCodes = () =>
+		track.db
+			.prepare(
+				"UPDATE verification SET value = json_set(value, '$.goodUntil', ?1, '$.sweepAt', ?1) WHERE identifier LIKE 'track-connect:%'",
+			)
+			.bind(Date.now() - 1000)
+			.run();
+	/** Makes every code row past its `expires_at`, which is all a row from Track 0.39.0 has. */
+	const expireRows = () =>
+		track.db
+			.prepare("UPDATE verification SET expires_at = ? WHERE identifier LIKE 'track-connect:%'")
+			.bind(Date.now() - 1000)
+			.run();
+
+	async function takenBackBy(workspaceId: string, owner: Person) {
+		return (await auditOf(workspaceId, owner)).filter(
+			(each) => each.action === "agent.deleted" && each.actorId === null,
+		);
+	}
+
+	it("takes back the agent and the webhook when a code is refused, and answers as ever", async () => {
+		const { owner, workspaceId, slug } = await setUp("refused");
+
+		// A wrong verifier.
+		const v1 = newVerifier();
+		const first = await allow(owner, slug, v1);
+		expect(await agentCount(workspaceId)).toBe(1);
+		const wrong = await exchange(first.code, newVerifier());
+		expect(wrong.status).toBe(400);
+		const answer = await wrong.text();
+		expect(JSON.parse(answer)).toEqual(NO_CODE);
+		expect(await agentCount(workspaceId)).toBe(0);
+		expect(await webhooksOf(workspaceId, owner)).toEqual([]);
+		expect(await codeRows()).toEqual([]);
+
+		// A seal that does not open.
+		const v2 = newVerifier();
+		const second = await allow(owner, slug, v2);
+		const [row] = await codeRows();
+		const value = JSON.parse(row?.value ?? "{}") as { ct: string };
+		// A change whatever it ended with.
+		value.ct = `${value.ct.slice(0, -2)}${value.ct.endsWith("AA") ? "BB" : "AA"}`;
+		await track.db
+			.prepare("UPDATE verification SET value = ? WHERE identifier = ?")
+			.bind(JSON.stringify(value), row?.identifier)
+			.run();
+		const broken = await exchange(second.code, v2);
+		expect(broken.status).toBe(400);
+		expect(await broken.text()).toBe(answer);
+		expect(await agentCount(workspaceId)).toBe(0);
+		expect(await webhooksOf(workspaceId, owner)).toEqual([]);
+
+		// Late.
+		const v3 = newVerifier();
+		const third = await allow(owner, slug, v3);
+		await expireCodes();
+		const late = await exchange(third.code, v3);
+		expect(late.status).toBe(400);
+		expect(await late.text()).toBe(answer);
+		expect(await agentCount(workspaceId)).toBe(0);
+		expect(await webhooksOf(workspaceId, owner)).toEqual([]);
+
+		// Each is in the log, by Track itself, with who asked and no secret.
+		const events = await takenBackBy(workspaceId, owner);
+		expect(events).toHaveLength(3);
+		for (const event of events) expect(event.detail).toMatchObject({ origin: asker });
+		expect(JSON.stringify(events)).not.toContain(first.code);
+	});
+
+	it("takes back only what the refused code made", async () => {
+		const { owner, workspaceId, slug } = await setUp("only-its-own");
+		const refusedOne = await allow(owner, slug, newVerifier());
+		const verifier = newVerifier();
+		const made = await allow(owner, slug, verifier);
+		const keptSecrets = await exchanged(made.code, verifier);
+		expect(await agentCount(workspaceId)).toBe(2);
+		expect((await exchange(refusedOne.code, newVerifier())).status).toBe(400);
+		expect(await agentCount(workspaceId)).toBe(1);
+		const [webhook] = await webhooksOf(workspaceId, owner);
+		expect(webhook).toMatchObject({ id: keptSecrets.webhook.id, agentId: keptSecrets.agent.id });
+	});
+
+	it("sweeps a code nobody traded when the next connection is approved", async () => {
+		const { owner, workspaceId, slug } = await setUp("swept-by-allow");
+		await allow(owner, slug, newVerifier());
+		expect(await agentCount(workspaceId)).toBe(1);
+		await expireCodes();
+
+		const verifier = newVerifier();
+		const { code } = await allow(owner, slug, verifier);
+		// Only the new one is left, and it still works.
+		expect(await agentCount(workspaceId)).toBe(1);
+		expect(await webhooksOf(workspaceId, owner)).toHaveLength(1);
+		expect(await codeRows()).toHaveLength(1);
+		const secrets = await exchanged(code, verifier);
+		expect((await webhooksOf(workspaceId, owner))[0]).toMatchObject({ agentId: secrets.agent.id });
+		expect(await takenBackBy(workspaceId, owner)).toHaveLength(1);
+	});
+
+	it("sweeps a handful at a time on Allow, and the rest on the daily run", async () => {
+		const { owner, workspaceId, slug } = await setUp("swept-in-bounds");
+		for (let i = 0; i < 8; i++) await allow(owner, slug, newVerifier());
+		expect(await agentCount(workspaceId)).toBe(8);
+		await expireCodes();
+		await allow(owner, slug, newVerifier());
+		const left = await agentCount(workspaceId);
+		expect(left).toBeGreaterThan(1);
+		expect(left).toBeLessThan(9);
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(1);
+		expect(await codeRows()).toHaveLength(1);
+	});
+
+	it("sweeps a code nobody traded on the daily run", async () => {
+		const { owner, workspaceId, slug } = await setUp("swept-by-cron");
+		await allow(owner, slug, newVerifier());
+		expect(await agentCount(workspaceId)).toBe(1);
+		await expireCodes();
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(0);
+		expect(await webhooksOf(workspaceId, owner)).toEqual([]);
+		expect(await codeRows()).toEqual([]);
+		const [event] = await takenBackBy(workspaceId, owner);
+		expect(event?.detail).toMatchObject({ origin: asker });
+	});
+
+	it("still takes back after a sign-in elsewhere cleared the table of what had run out", async () => {
+		const { owner, workspaceId, slug } = await setUp("kept-past-cleanup");
+		await allow(owner, slug, newVerifier());
+		await expireCodes();
+		// What Better Auth runs whenever it looks a verification up, a sign-in for one: every row
+		// past its `expires_at` goes. Here as it would two minutes on, when the code's minute is
+		// over; a code's row is not past its `expires_at` for days.
+		await track.db
+			.prepare("DELETE FROM verification WHERE expires_at < ?")
+			.bind(Date.now() + 2 * 60_000)
+			.run();
+		expect(await codeRows()).toHaveLength(1);
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(0);
+		expect(await webhooksOf(workspaceId, owner)).toEqual([]);
+		expect(await codeRows()).toEqual([]);
+	});
+
+	it("tries again later when taking back failed, and the code opens nothing meanwhile", async () => {
+		const { owner, workspaceId, slug } = await setUp("taken-back-later");
+		const verifier = newVerifier();
+		const { code } = await allow(owner, slug, verifier);
+		await expireCodes();
+
+		// The agent's rows cannot be deleted for now, so taking it back fails part of the way.
+		await track.db
+			.prepare(
+				"CREATE TRIGGER test_keep_member BEFORE DELETE ON member BEGIN SELECT RAISE(ABORT, 'broken for a test'); END",
+			)
+			.run();
+		try {
+			await track.runScheduled();
+		} finally {
+			await track.db.prepare("DROP TRIGGER test_keep_member").run();
+		}
+		expect(await agentCount(workspaceId)).toBe(1);
+
+		// The row is back, for later: nothing of the seal in it, and no code opens it.
+		const [kept] = await codeRows();
+		const value = JSON.parse(kept?.value ?? "{}") as Record<string, unknown>;
+		expect(value).toMatchObject({ workspaceId, tries: 1, goodUntil: 0 });
+		expect(value.sweepAt).toBeGreaterThan(Date.now() + 30 * 60_000);
+		expect(Object.keys(value)).not.toContain("ct");
+		// Under a name no code hashes to: an exchange with the code finds nothing, so an asking
+		// server that tries again cannot use the tries up in seconds.
+		expect(kept?.identifier).toMatch(/^track-connect:retry\./);
+		expect((await exchange(code, verifier)).status).toBe(400);
+		expect(await codeRows()).toHaveLength(1);
+		expect(JSON.parse((await codeRows())[0]?.value ?? "{}")).toMatchObject({ tries: 1 });
+		// Not due yet, so a run now leaves it.
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(1);
+
+		// When it is due, the agent goes.
+		await expireCodes();
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(0);
+		expect(await codeRows()).toEqual([]);
+		expect((await exchange(code, verifier)).status).toBe(400);
+	});
+
+	it("sweeps beside rows of Better Auth's whose values are not JSON, and matches its own prefix exactly", async () => {
+		const { owner, workspaceId, slug } = await setUp("beside-others");
+		await allow(owner, slug, newVerifier());
+		await expireCodes();
+		// What Better Auth keeps for a password reset: a bare id. And a row named like ours but for
+		// the case, which is not ours.
+		const insert =
+			"INSERT INTO verification (id, identifier, value, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)";
+		const later = Date.now() + 60 * 60_000;
+		await track.db
+			.prepare(insert)
+			.bind("test-plain", "reset-password:abc", "not json at all", later, Date.now(), Date.now())
+			.run();
+		await track.db
+			.prepare(insert)
+			.bind("test-case", "TRACK-CONNECT:abc", "also not json", later, Date.now(), Date.now())
+			.run();
+		try {
+			await track.runScheduled();
+			expect(await agentCount(workspaceId)).toBe(0);
+			// Ours is gone. The helper's LIKE ignores case, so it still lists the one that is not ours.
+			expect((await codeRows()).map((each: { identifier: string }) => each.identifier)).toEqual([
+				"TRACK-CONNECT:abc",
+			]);
+			const { results } = await track.db
+				.prepare("SELECT id FROM verification WHERE id IN ('test-plain', 'test-case') ORDER BY id")
+				.all<{ id: string }>();
+			expect(results.map((each: { id: string }) => each.id)).toEqual(["test-case", "test-plain"]);
+		} finally {
+			await track.db
+				.prepare("DELETE FROM verification WHERE id IN ('test-plain', 'test-case')")
+				.run();
+		}
+	});
+
+	it("leaves an agent that someone took over by hand before its code ran out", async () => {
+		const { owner, workspaceId, slug } = await setUp("taken-over");
+		await allow(owner, slug, newVerifier());
+		// An admin found it in Settings and used it: its key has been used.
+		await track.db
+			.prepare("UPDATE agent_key SET last_used_at = ? WHERE organization_id = ?")
+			.bind(Date.now(), workspaceId)
+			.run();
+		await expireCodes();
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(1);
+		expect(await webhooksOf(workspaceId, owner)).toHaveLength(1);
+		expect(await codeRows()).toEqual([]);
+	});
+
+	it("leaves an agent whose first key was replaced by hand, though it has one unused key again", async () => {
+		const { owner, workspaceId, slug } = await setUp("key-replaced");
+		await allow(owner, slug, newVerifier());
+		// An admin gave it a key of their own and revoked the connection's: one key, never used,
+		// which only its id tells from the first.
+		await track.db
+			.prepare("UPDATE agent_key SET id = 'replaced-by-hand' WHERE organization_id = ?")
+			.bind(workspaceId)
+			.run();
+		await expireCodes();
+		await track.runScheduled();
+		expect(await agentCount(workspaceId)).toBe(1);
+		expect(await webhooksOf(workspaceId, owner)).toHaveLength(1);
+	});
+
+	it("leaves an agent whose code was traded, and one made by hand, to a sweep", async () => {
+		const { owner, workspaceId, slug } = await setUp("sweep-spares");
+		const byHand = await (
+			await authApi("/agents/create", owner.cookie, {
+				organizationId: workspaceId,
+				name: "By hand",
+			})
+		).json();
+		const verifier = newVerifier();
+		const { code } = await allow(owner, slug, verifier);
+		const secrets = await exchanged(code, verifier);
+		await allow(owner, slug, newVerifier());
+		await expireCodes();
+		await track.runScheduled();
+		// The traded one and the one by hand; the untraded one is gone.
+		expect(await agentCount(workspaceId)).toBe(2);
+		const hooks = await webhooksOf(workspaceId, owner);
+		expect(hooks.map((each) => each.agentId)).toEqual([secrets.agent.id]);
+		const ids = new Set(
+			((await track.directory(workspaceId)).members as { id: string; removedAt?: number }[])
+				.filter((each) => !each.removedAt)
+				.map((each) => each.id),
+		);
+		expect(ids.has(secrets.agent.id)).toBe(true);
+		expect(ids.has((byHand as { agent: { id: string } }).agent.id)).toBe(true);
+		// Its key still opens /mcp.
+		const mcp = await mcpAs(secrets.agentKey);
+		await mcp.close();
+	});
+
+	it("takes nothing back, and spends nothing, for a body of the wrong shape", async () => {
+		const { owner, workspaceId, slug } = await setUp("shapeless");
+		const verifier = newVerifier();
+		const { code } = await allow(owner, slug, verifier);
+		for (const body of [
+			{ code, verifier: "short" },
+			{ code },
+			{ verifier },
+			{ code: 1, verifier },
+		]) {
+			const answer = await post("/api/connect/exchange", body);
+			expect(answer.status).toBe(400);
+			expect(await answer.json()).toEqual(NO_CODE);
+		}
+		expect(await agentCount(workspaceId)).toBe(1);
+		expect(await webhooksOf(workspaceId, owner)).toHaveLength(1);
+		expect(await codeRows()).toHaveLength(1);
+		await exchanged(code, verifier);
+	});
+
+	it("deletes a row written before the ids were readable, without an error", async () => {
+		const { owner, workspaceId, slug } = await setUp("legacy");
+		const strip = async () => {
+			const [row] = await codeRows();
+			const value = JSON.parse(row?.value ?? "{}") as Record<string, unknown>;
+			// What Track 0.39.0 wrote: the challenge and the seal, nothing more.
+			for (const key of Object.keys(value)) {
+				if (!["v", "challenge", "iv", "ct"].includes(key)) delete value[key];
+			}
+			// And a row that ran out with its code, a minute on.
+			await track.db
+				.prepare("UPDATE verification SET value = ?, expires_at = ? WHERE identifier = ?")
+				.bind(JSON.stringify(value), Date.now() + 60_000, row?.identifier)
+				.run();
+		};
+
+		// The daily run: the row goes with everything else past its time, and there is nothing to
+		// take back.
+		await allow(owner, slug, newVerifier());
+		await strip();
+		await expireRows();
+		await track.runScheduled();
+		expect(await codeRows()).toEqual([]);
+		expect(await agentCount(workspaceId)).toBe(1);
+
+		// Refused: the same answer, and the row goes.
+		const { code } = await allow(owner, slug, newVerifier());
+		await strip();
+		const refused = await exchange(code, newVerifier());
+		expect(refused.status).toBe(400);
+		expect(await refused.json()).toEqual(NO_CODE);
+		expect(await codeRows()).toEqual([]);
+		expect(await agentCount(workspaceId)).toBe(2);
 	});
 });
