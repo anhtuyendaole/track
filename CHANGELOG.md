@@ -8,6 +8,27 @@ read its entry before updating a self-hosted copy.
 Each version's [GitHub release](https://github.com/gateweavehq/track/releases) carries the same
 notes. Publishing a release deploys it to Gateweave Cloud.
 
+## [0.39.5] - 2026-11-16
+
+Puts back a guard that v0.39.4 dropped by mistake. There is no migration in this release.
+
+### Fixed
+
+- **A server function's request from another origin is refused again.** The framework refuses
+  such a request unless the browser says it comes from the app's own origin. v0.39.4 added a file
+  that replaced the framework's default without listing that guard, so for some hours it did not
+  run. The session cookie is `SameSite=Lax`, which browsers keep off another site's `POST`
+  requests, and everything that changes something is a `POST`, so a page on an unrelated site
+  could not act as a signed-in person in such a browser. A page on another host of the same site (another
+  subdomain of the deployment's domain) could have, for the settings a workspace's pages change:
+  webhooks, the GitHub connection, notification settings, a guided team. Issues and everything
+  that syncs go through the sync gateway, which checks the origin itself and was not affected.
+  ([#322])
+
+### If you run your own
+
+- **If you run v0.39.4, update.**
+
 ## [0.39.4] - 2026-11-16
 
 A database read that fails in passing is asked again instead of becoming an error, and a query
@@ -1913,6 +1934,7 @@ The first pre-release.
 [#314]: https://github.com/gateweavehq/track/pull/314
 [#316]: https://github.com/gateweavehq/track/pull/316
 [#320]: https://github.com/gateweavehq/track/pull/320
+[#322]: https://github.com/gateweavehq/track/pull/322
 [#295]: https://github.com/gateweavehq/track/pull/295
 [#294]: https://github.com/gateweavehq/track/pull/294
 [#293]: https://github.com/gateweavehq/track/pull/293
