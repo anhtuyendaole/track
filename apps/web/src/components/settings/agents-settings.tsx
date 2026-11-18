@@ -92,7 +92,7 @@ function PersonalMcpSetup({ mcpUrl }: { mcpUrl: string }) {
 		"Connect my AI assistant to Gateweave Track using this remote MCP endpoint:",
 		mcpUrl,
 		"Use the MCP client's browser-based OAuth sign-in so it acts as me. Do not ask me to paste a password or agent key into chat.",
-		"After connecting, call get_workspace to discover my workspaces and teams before creating or changing issues.",
+		"After connecting, call list_workspaces to discover my workspaces. Then call get_workspace with the chosen workspace slug to learn its teams and statuses before creating or changing issues.",
 		"For unattended automation, ask a workspace admin to create a separate agent member in Settings > Agents.",
 	].join("\n\n");
 
