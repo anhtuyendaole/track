@@ -92,7 +92,9 @@ export function protectResource(
 		}
 
 		if (!(await options.stillGranted(payload)))
-			throw unauthorized("access was taken back", "invalid_token");
+			// No error code: the challenge must read as it does for a token that fails to verify, or
+			// its header tells a revoked grant apart from any other invalid token.
+			throw unauthorized("access was taken back");
 		return payload;
 	}
 
