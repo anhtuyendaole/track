@@ -8,6 +8,15 @@ export interface StoredReplica {
 	snapshot: Snapshot | null;
 	/** Unconfirmed mutations, in the order they were made. */
 	pending: PendingMutation[];
+	/** Rows whose stored shape cannot be read by this build. */
+	unreadable: { id: string; name: string; args: Record<string, unknown> }[];
+}
+
+export class PendingFormatError extends Error {
+	constructor(format: unknown) {
+		super(`This version of Track cannot read changes stored in pending format ${String(format)}`);
+		this.name = "PendingFormatError";
+	}
 }
 
 /**
@@ -28,6 +37,8 @@ export interface Persistence {
 	/** Stores mutations in order, in one write. */
 	addPending(...mutations: PendingMutation[]): Promise<void>;
 	removePending(id: string): Promise<void>;
+	/** A newer tab needs this database closed after queued client writes finish. */
+	onTaken?(listener: () => void): void;
 	close(): void;
 }
 
@@ -43,6 +54,7 @@ export class MemoryPersistence implements Persistence {
 			clientId: this.#clientId,
 			snapshot: this.#snapshot && structuredClone(this.#snapshot),
 			pending: structuredClone(this.#pending),
+			unreadable: [],
 		};
 	}
 

@@ -13,7 +13,12 @@ import {
 	type ServerMessage,
 	type Snapshot,
 } from "@gateweave/track-protocol";
-import { MemoryPersistence, type Persistence, type StoredReplica } from "./persistence";
+import {
+	MemoryPersistence,
+	PendingFormatError,
+	type Persistence,
+	type StoredReplica,
+} from "./persistence";
 import { type Delta, type PendingMutation, Replica, type SyncState } from "./store";
 import { type ConnectionStatus, standaloneTabs, type TabMessage, type Tabs } from "./tabs";
 import { HttpError, type SyncSocket, type Transport } from "./transport";
@@ -32,7 +37,8 @@ export class MutationError extends Error {
 	constructor(
 		readonly reason: RejectReason,
 		message: string,
-		readonly mutation: Mutation,
+		readonly mutation: Mutation | { name: string; args: Record<string, unknown> },
+		readonly storedUnreadable = false,
 	) {
 		super(message);
 		this.name = "MutationError";
@@ -107,6 +113,8 @@ export class SyncClient {
 	readonly #waiters = new Map<string, Waiter>();
 	/** Mutations this tab loaded from storage at startup. */
 	readonly #restored = new Set<string>();
+	#unreadable: StoredReplica["unreadable"] = [];
+	#taken = false;
 	/** Tab messages held back while state loads from storage, replayed afterwards. */
 	#held: TabMessage[] | null = [];
 	/** Storage writes, each followed by the tab message that announces it. Runs in order. */
@@ -184,6 +192,7 @@ export class SyncClient {
 		{ report = true }: { report?: boolean } = {},
 	): Promise<number>[] {
 		if (this.#role === "closed") throw new Error("This SyncClient is closed");
+		if (this.#taken) throw new Error("A newer version of Track has taken over this tab's storage");
 		const now = Date.now();
 		// Validate exactly what the server will receive: JSON drops undefined fields. Text pasted
 		// into the app may carry NUL characters or lone surrogates, which the server refuses; they
@@ -206,7 +215,6 @@ export class SyncClient {
 		});
 
 		this.#replica.addPending(...pending);
-		const [one] = pending;
 		// One message per mutation, as for one at a time, which a tab of an earlier build still reads.
 		this.#write(
 			(p) => p.addPending(...pending),
@@ -246,6 +254,10 @@ export class SyncClient {
 		try {
 			persistence = await (this.#options.persistence ?? new MemoryPersistence());
 		} catch (error) {
+			if (error instanceof PendingFormatError) {
+				this.#unreadableStorage(error);
+				return;
+			}
 			console.warn("sync: local storage is unavailable; keeping data in memory", error);
 			persistence = new MemoryPersistence();
 		}
@@ -254,11 +266,17 @@ export class SyncClient {
 		else this.#options.tabs?.close();
 		// Subscribe before loading so nothing announced during the load is missed.
 		this.#tabs.subscribe((message) => this.#onTabMessage(message));
+		persistence.onTaken?.(() => void this.#handOver());
 
 		let stored: StoredReplica;
 		try {
 			stored = await persistence.load();
 		} catch (error) {
+			if (error instanceof PendingFormatError) {
+				persistence.close();
+				this.#unreadableStorage(error);
+				return;
+			}
 			console.warn("sync: could not read local storage; keeping data in memory", error);
 			persistence.close();
 			this.#tabs.close();
@@ -281,7 +299,28 @@ export class SyncClient {
 	#load(stored: StoredReplica): void {
 		if (stored.snapshot) this.#replica.reset(stored.snapshot, { onlyIfNewer: true });
 		this.#replica.addPending(...stored.pending);
+		this.#unreadable = stored.unreadable;
 		if (this.#replica.hasData) this.#setStatus({ loaded: true });
+	}
+
+	#unreadableStorage(error: PendingFormatError): void {
+		this.#taken = true;
+		this.#fail("outdated");
+		this.#tabs.close();
+		this.#options.tabs?.close();
+		this.#options.onReject?.(
+			new MutationError("invalid", error.message, { name: "Stored changes", args: {} }, true),
+		);
+	}
+
+	async #handOver(): Promise<void> {
+		if (this.#taken || this.#role === "closed") return;
+		this.#taken = true;
+		this.#fail("outdated");
+		await this.#started.catch(() => {});
+		await this.#writes;
+		this.#tabs.close();
+		this.#persistence.close();
 	}
 
 	/** Re-reads shared storage after this follower fell behind or the leader replaced it. */
@@ -348,6 +387,23 @@ export class SyncClient {
 	#lead(): void {
 		if (this.#role === "closed") return;
 		this.#role = "leader";
+		for (const change of this.#unreadable) {
+			this.#write((p) => p.removePending(change.id), {
+				type: "reject",
+				id: change.id,
+				reason: "invalid",
+				message: "This version of Track cannot read the stored change",
+			});
+			this.#options.onReject?.(
+				new MutationError(
+					"invalid",
+					"This version of Track cannot read the stored change",
+					change,
+					true,
+				),
+			);
+		}
+		this.#unreadable = [];
 		void this.#connect();
 	}
 
